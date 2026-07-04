@@ -2865,8 +2865,23 @@ def execute(name, args):
 # ============================================================
 # LLM CALL
 # ============================================================
+MAX_TOKENS = 128000
+
+def estimate_tokens(m):
+    return len(str(m)) // 4
+
+def _trim_messages(messages, max_tokens):
+    total = sum(estimate_tokens(m) for m in messages)
+    while total > max_tokens and len(messages) > 2:
+        removed = messages.pop(1)
+        total -= estimate_tokens(removed)
+    return messages
+
 def call_llm(messages):
     global _current_model_config
+    
+    messages = _trim_messages(messages, MAX_TOKENS)
+    
     _joki_cancel.clear()
     _attempted_ids = set()  # track (base_url, model) tuples tried in this call
 
