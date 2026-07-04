@@ -2924,18 +2924,70 @@ def call_llm(messages):
                     headers = {"Content-Type": "application/json"}
                     if key:
                         headers["Authorization"] = f"Bearer {key}"
-                    if is_openai:
-                        url = f"{model_cfg['base_url']}/chat/completions"
-                        body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "tool_choice": "auto", "max_tokens": 4096}
-                    else:
-                        url = f"{model_cfg['base_url']}/api/chat"
-                        body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "stream": False, "max_tokens": 4096}
-                    import random, time
+                    import random, time, json
                     MAX_RETRIES = 3
                     RETRYABLE_ERRORS = (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError)
                     for retry in range(MAX_RETRIES):
                         try:
-                            r = httpx.post(url, json=body, headers=headers, timeout=120, follow_redirects=True)
+                            if is_openai:
+                                url = f"{model_cfg['base_url']}/chat/completions"
+                                body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "tool_choice": "auto", "max_tokens": 4096, "stream": True}
+                                
+                                content_parts = []
+                                tool_calls_dict = {}
+                                message_role = "assistant"
+                                
+                                with httpx.stream("POST", url, json=body, headers=headers, timeout=120, follow_redirects=True) as r:
+                                    if r.status_code != 200:
+                                        err_data = r.read()
+                                        raise httpx.HTTPStatusError(f"{err_data}", request=r.request, response=r)
+                                    for line in r.iter_lines():
+                                        if line.startswith("data: ") and line != "data: [DONE]":
+                                            chunk = json.loads(line[6:])
+                                            if "choices" in chunk and chunk["choices"]:
+                                                delta = chunk["choices"][0].get("delta", {})
+                                                if "role" in delta:
+                                                    message_role = delta["role"]
+                                                if "content" in delta and delta["content"]:
+                                                    content = delta["content"]
+                                                    print(content, end="", flush=True)
+                                                    content_parts.append(content)
+                                                if "tool_calls" in delta and delta["tool_calls"]:
+                                                    for tc in delta["tool_calls"]:
+                                                        tc_idx = tc["index"]
+                                                        if tc_idx not in tool_calls_dict:
+                                                            tool_calls_dict[tc_idx] = tc
+                                                        else:
+                                                            if "function" in tc:
+                                                                if "name" in tc["function"]:
+                                                                    tool_calls_dict[tc_idx]["function"].setdefault("name", "")
+                                                                    tool_calls_dict[tc_idx]["function"]["name"] += tc["function"]["name"]
+                                                                if "arguments" in tc["function"]:
+                                                                    tool_calls_dict[tc_idx]["function"].setdefault("arguments", "")
+                                                                    tool_calls_dict[tc_idx]["function"]["arguments"] += tc["function"]["arguments"]
+                                
+                                final_msg = {"role": message_role}
+                                if content_parts:
+                                    final_msg["content"] = "".join(content_parts)
+                                    print()
+                                else:
+                                    final_msg["content"] = None
+                                
+                                if tool_calls_dict:
+                                    final_msg["tool_calls"] = [tool_calls_dict[i] for i in sorted(tool_calls_dict.keys())]
+                                
+                                result.append(final_msg)
+                            else:
+                                url = f"{model_cfg['base_url']}/api/chat"
+                                body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "stream": False, "max_tokens": 4096}
+                                r = httpx.post(url, json=body, headers=headers, timeout=120, follow_redirects=True)
+                                data = r.json()
+                                if r.status_code != 200:
+                                    raise httpx.HTTPStatusError(f"{data}", request=r.request, response=r)
+                                err_info = data.get("error") or data.get("error_code")
+                                if err_info:
+                                    raise httpx.HTTPStatusError(f"{err_info}", request=r.request, response=r)
+                                result.append(data["message"])
                             break
                         except RETRYABLE_ERRORS as e:
                             if retry == MAX_RETRIES - 1:
@@ -2943,16 +2995,6 @@ def call_llm(messages):
                             delay = (2 ** retry) + random.uniform(0, 1)
                             _console.print(f"[yellow]Network error, retry in {delay:.1f}s...[/yellow]")
                             time.sleep(delay)
-                    data = r.json()
-                    if r.status_code != 200:
-                        raise httpx.HTTPStatusError(f"{data}", request=r.request, response=r)
-                    err_info = data.get("error") or data.get("error_code")
-                    if err_info:
-                        raise httpx.HTTPStatusError(f"{err_info}", request=r.request, response=r)
-                    if is_openai:
-                        result.append(data["choices"][0]["message"])
-                    else:
-                        result.append(data["message"])
                 except Exception as e:
                     err_resp = getattr(e, "response", None)
                     if err_resp is not None:
