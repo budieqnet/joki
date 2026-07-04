@@ -2764,7 +2764,19 @@ def execute(name, args):
                 lines.append(f"    Codec: {s.get('codec_name', 'N/A')}")
                 if codec_type == "video":
                     lines.append(f"    Resolution: {s.get('width', 'N/A')}x{s.get('height', 'N/A')}")
-                    lines.append(f"    FPS: {eval(s.get('r_frame_rate', '0/1')):.2f}" if "/" in s.get("r_frame_rate", "") else f"    FPS: {s.get('r_frame_rate', 'N/A')}")
+                    rate = s.get('r_frame_rate', '0/1')
+                    if '/' in rate:
+                        try:
+                            num, den = rate.split('/')
+                            fps = float(int(num) / int(den)) if int(den) else 0.0
+                        except ValueError:
+                            fps = 0.0
+                    else:
+                        try:
+                            fps = float(rate)
+                        except ValueError:
+                            fps = 0.0
+                    lines.append(f"    FPS: {fps:.2f}")
                     lines.append(f"    Pixel Format: {s.get('pix_fmt', 'N/A')}")
                 elif codec_type == "audio":
                     lines.append(f"    Sample Rate: {s.get('sample_rate', 'N/A')} Hz")
