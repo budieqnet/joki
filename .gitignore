@@ -1,0 +1,6 @@
+venv/
+config.json
+joki/config.json
+*.bak
+__pycache__/
+*.pyc
