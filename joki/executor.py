@@ -1,22 +1,26 @@
-import os, json, re, subprocess, socket
 from joki.state import *
-from joki.utils import *
-from joki.display import _numbered
-from joki.tools.files import *
-from joki.tools.shell import *
 from joki.tools.database import *
-from joki.tools.memory import *
-from joki.tools.security import *
-from joki.tools.reverse_eng import *
+from joki.tools.deps import *
+from joki.tools.files import *
+from joki.tools.git import *
+from joki.tools.hardware import *
+from joki.tools.lint import *
+from joki.tools.lsp import handle_lsp_query
 from joki.tools.media import *
+from joki.tools.memory import *
+from joki.tools.office import handle_read_office, handle_write_office
+from joki.tools.reverse_eng import *
+from joki.tools.security import *
+from joki.tools.shell import *
 from joki.tools.ui import *
 from joki.tools.web import *
-from joki.tools.hardware import *
-from joki.tools.lsp import handle_lsp_query
+from joki.utils import *
+
 TOOL_HANDLERS = {
     "read_file": handle_read_file,
     "write_file": handle_write_file,
     "edit_file": handle_edit_file,
+    "undo_edit": handle_undo_edit,
     "run_command": handle_run_command,
     "search_code": handle_search_code,
     "glob": handle_glob,
@@ -64,6 +68,30 @@ TOOL_HANDLERS = {
     "video_info": handle_video_info,
     "video_extract": handle_video_extract,
     "lsp_query": handle_lsp_query,
+    "read_office": handle_read_office,
+    "write_office": handle_write_office,
+    "web_scrape": handle_web_scrape,
+    "web_login": handle_web_login,
+    "web_logout": handle_web_logout,
+    "web_sessions": handle_web_session_list,
+    "git_status": handle_git_status,
+    "git_diff": handle_git_diff,
+    "git_log": handle_git_log,
+    "git_commit": handle_git_commit,
+    "git_push": handle_git_push,
+    "git_pull": handle_git_pull,
+    "git_branch": handle_git_branch,
+    "git_clone": handle_git_clone,
+    "git_init": handle_git_init,
+    "git_add": handle_git_add,
+    "git_merge": handle_git_merge,
+    "git_stash": handle_git_stash,
+    "git_remote": handle_git_remote,
+    "run_linter": handle_run_linter,
+    "lint_install": handle_lint_install,
+    "run_tests": handle_run_tests,
+    "analyze_deps": handle_analyze_deps,
+    "impact_analysis": handle_impact_analysis,
 }
 
 def execute(name, args):
@@ -76,7 +104,7 @@ def execute(name, args):
         return handler(args)
     except KeyError as e:
         return f"Error: Missing required parameter '{e}' for tool '{name}'. LLM harus menyertakan parameter ini."
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 
 # ============================================================

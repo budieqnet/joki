@@ -1,69 +1,307 @@
-import json, time, httpx, random, threading
+import copy
+import json
+import random
+import threading
+import time
+
+import httpx
+
+from joki.config import _MODELS, _current_model_config
+from joki.constants import CORE_TOOLS, MAX_TOKENS, TOOLS, get_tools_for_mode
+from joki.display import _border_error, _color_error, _color_warn
 from joki.state import *
-from joki.config import _current_model_config, _MODELS
-from joki.display import stream_print
 from joki.thinking import ThinkingDisplay
-from joki.constants import TOOLS
-MAX_TOKENS = 128000
+
+
+def _current_tools():
+    mode = _current_task_mode
+    if mode == MODE_GENERAL:
+        # Kurangi overhead: hanya tool inti + tool yang pernah dipakai
+        names = set(CORE_TOOLS) | set(_recent_tools)
+        return [t for t in TOOLS if t["function"]["name"] in names]
+    return get_tools_for_mode(mode)
+SUMMARY_TRIGGER_RATIO = 0.65
+SUMMARY_WORKING_SET = 8
+_SUMMARY_MSG_CHARS = 2000
+_SUMMARY_TOTAL_CHARS = 120000
+_SUMMARY_PROMPT = (
+    "Kamu adalah perangkum konteks internal asisten Joki. "
+    "Ringkas pesan-pesan percakapan berikut dalam Bahasa Indonesia, padat dan faktual. "
+    "Pertahankan: tujuan & permintaan user, keputusan dan rencana yang disepakati, "
+    "fakta penting (path file, perintah, angka), hasil tool yang berhasil, "
+    "serta masalah/kendala yang masih berjalan. "
+    "Hilangkan salam, basa-basi, dan detail yang sudah tidak relevan. "
+    "Jangan memanggil tool apa pun. Jangan balas user. "
+    "Keluarkan hanya teks ringkasan, maksimal 1500 kata."
+)
 
 def estimate_tokens(m):
     return len(str(m)) // 4
 
+def _system_prefix_len(messages):
+    """Jumlah pesan system berturut-turut di awal (dilindungi dari trim/summarize)."""
+    n = 0
+    for m in messages:
+        if m.get("role") == "system":
+            n += 1
+        else:
+            break
+    return n
+
+def _find_trim_units(messages):
+    """Kembalikan daftar (start, end) blok pesan yang boleh dihapus bersama
+    tanpa merusak invariant API: assistant.tool_calls harus berpasangan dengan
+    tool result miliknya. Pesan system di awal tidak pernah dihapus."""
+    units = []
+    i = _system_prefix_len(messages)
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            tool_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
+            j = i + 1
+            consumed = 0
+            while j < n and consumed < len(tool_ids):
+                if messages[j].get("role") == "tool" and messages[j].get("tool_call_id") in tool_ids:
+                    consumed += 1
+                j += 1
+            units.append((i, j))
+            i = j
+        else:
+            units.append((i, i + 1))
+            i += 1
+    return units
+
 def _trim_messages(messages, max_tokens):
     total = sum(estimate_tokens(m) for m in messages)
     while total > max_tokens and len(messages) > 2:
-        # Hapus tool result terbesar, bukan yang paling lama
-        tool_idx = None
-        tool_size = -1
-        for i in range(1, len(messages)):
-            if messages[i].get("role") == "tool":
-                sz = len(str(messages[i].get("content", "")))
-                if sz > tool_size:
-                    tool_size = sz
-                    tool_idx = i
-        if tool_idx is not None and tool_size > 100:
-            removed = messages.pop(tool_idx)
-            total -= estimate_tokens(removed)
-        else:
-            # Fallback: hapus yang paling lama (FIFO)
-            removed = messages.pop(1)
-            total -= estimate_tokens(removed)
+        units = _find_trim_units(messages)
+        # Jangan buang pesan terakhir (turn user yang aktif)
+        removable = [u for u in units if u[1] < len(messages)]
+        if not removable:
+            break
+        # Buang blok terbesar dulu agar total cepat turun
+        def _u_size(u):
+            return sum(estimate_tokens(messages[k]) for k in range(u[0], u[1]))
+        start, end = max(removable, key=_u_size)
+        for k in range(end - 1, start - 1, -1):
+            total -= estimate_tokens(messages.pop(k))
     return messages
 
+def _safe_split(messages, keep):
+    """Indeks awal suffix terakhir yang 'closed under pairing': semua tool result
+    di dalamnya tetap punya pasangan assistant.tool_calls-nya. Prefix system
+    selalu dilindungi."""
+    proto = _system_prefix_len(messages)
+    start = max(proto, len(messages) - keep)
+    n = len(messages)
+    while True:
+        updated = False
+        for i in range(start, n):
+            m = messages[i]
+            if m.get("role") == "tool":
+                tcid = m.get("tool_call_id")
+                for a in range(i - 1, proto - 1, -1):
+                    am = messages[a]
+                    if am.get("role") == "assistant" and am.get("tool_calls"):
+                        ids = {tc.get("id") for tc in am["tool_calls"]}
+                        if tcid in ids:
+                            if a < start:
+                                start = a
+                                updated = True
+                            break
+        if not updated:
+            break
+    return start
+
+def _call_summary(model_cfg, old_messages):
+    """Panggil LLM (bukan via call_llm agar tidak rekursif) untuk meringkas.
+    Mengembalikan teks ringkasan, atau None bila gagal."""
+    try:
+        parts = []
+        for m in old_messages:
+            c = (m.get("content") or "").strip()
+            if not c:
+                continue
+            if len(c) > _SUMMARY_MSG_CHARS:
+                c = c[: _SUMMARY_MSG_CHARS] + " ...[dipotong]"
+            if m.get("role") == "tool":
+                parts.append(f"[hasil tool {m.get('tool_call_id', '')}]\n{c}")
+            elif m.get("role") == "assistant":
+                extra = ""
+                if m.get("tool_calls"):
+                    names = ", ".join(tc.get("function", {}).get("name", "") for tc in m["tool_calls"])
+                    extra = f"\n(alat dipanggil: {names})"
+                parts.append(f"[asisten]{extra}\n{c}")
+            elif m.get("role") == "user":
+                parts.append(f"[user]\n{c}")
+            elif m.get("role") == "system":
+                parts.append(f"[sistem]\n{c}")
+        text = "\n\n---\n\n".join(parts)
+        if not text.strip():
+            return None
+        if len(text) > _SUMMARY_TOTAL_CHARS:
+            head = text[: _SUMMARY_TOTAL_CHARS // 2]
+            tail = text[-(_SUMMARY_TOTAL_CHARS // 2):]
+            text = head + "\n\n...[dipotong tengah]...\n\n" + tail
+        summary_messages = [
+            {"role": "system", "content": _SUMMARY_PROMPT},
+            {"role": "user", "content": text},
+        ]
+        provider = model_cfg.get("provider")
+        keys = model_cfg.get("api_keys") or [model_cfg.get("api_key", "")]
+        for key in keys:
+            if _joki_cancel.is_set():
+                return None
+            content = None
+            try:
+                if provider == "ollama":
+                    url = f"{model_cfg['base_url']}/api/chat"
+                    body = {"model": model_cfg["model"], "messages": summary_messages, "stream": False, "options": {"num_predict": 2048}}
+                    headers = {"Content-Type": "application/json"}
+                    if key:
+                        headers["Authorization"] = f"Bearer {key}"
+                else:
+                    url = f"{model_cfg['base_url']}/chat/completions"
+                    body = {"model": model_cfg["model"], "messages": summary_messages, "max_tokens": 2048, "stream": False}
+                    headers = {"Content-Type": "application/json"}
+                    if key:
+                        auth_header = model_cfg.get("api_key_header", "Authorization")
+                        if auth_header == "Authorization":
+                            headers["Authorization"] = f"Bearer {key}"
+                        else:
+                            headers[auth_header] = key
+                r = httpx.post(url, json=body, headers=headers, timeout=120, follow_redirects=True)
+                if r.status_code == 200:
+                    data = r.json()
+                    if provider == "ollama":
+                        content = (data.get("message") or {}).get("content", "")
+                    else:
+                        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+                content = None
+            if content and content.strip():
+                return content.strip()
+        return None
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+def _effective_max_tokens():
+    """Ambil context_window dari model aktif, fallback ke MAX_TOKENS konservatif
+    (128000) kalau model belum di-set context_window di config.json.
+
+    Selalu menyisakan ruang untuk token output (max_tokens) dari total
+    context_window/fallback, supaya riwayat + jawaban model tidak melebihi
+    kapasitas asli model -- baik untuk model yang context_window-nya
+    dikonfigurasi eksplisit maupun yang masih pakai fallback."""
+    mc = _current_model_config
+    cw = mc.get("context_window") or MAX_TOKENS
+    out = mc.get("max_tokens", 8192)
+    budget = int(cw) - out
+    budget = max(budget, 2048)
+    return min(budget, int(cw))
+
+def _summarize_context(messages):
+    """Ringkas pesan lama (di luar working set) jadi satu pesan system ringkasan
+    bila total estimasi token melewati ambang. Mutasi list in-place. Return list.
+    Prefix pesan system (system prompt, project index, checkpoint) dilindungi.
+
+    Ambang batas dihitung dari _effective_max_tokens() (context_window model
+    aktif dikurangi ruang output, fallback ke MAX_TOKENS konservatif) -- supaya
+    model dengan context window lebih besar dari 128K tidak diringkas
+    terlalu dini, dan model dengan context window lebih kecil tetap aman."""
+    mc = copy.deepcopy(_current_model_config)
+    proto = _system_prefix_len(messages)
+    total = sum(estimate_tokens(m) for m in messages)
+    if total <= int(_effective_max_tokens() * SUMMARY_TRIGGER_RATIO):
+        return messages
+    if len(messages) - proto <= SUMMARY_WORKING_SET + 1:
+        return messages
+    if _joki_cancel.is_set():
+        return messages
+    if mc.get("provider") == "google":
+        return messages
+    keep_start = _safe_split(messages, SUMMARY_WORKING_SET)
+    old = messages[proto:keep_start]
+    if not old:
+        return messages
+    summary = _call_summary(mc, old)
+    if not summary:
+        return messages
+    messages[:] = (
+        messages[:proto]
+        + [{"role": "system", "content": f"[RINGKASAN KONTEKS]\n{summary}"}]
+        + messages[keep_start:]
+    )
+    _console.print(f"[dim]↻ Konteks diringkas: {len(old)} pesan lama → ringkasan.[/dim]")
+    return messages
+
+def _is_small_talk(messages):
+    last = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last = (m.get("content") or "").strip().lower()
+            break
+    if len(last) > 150:
+        return False
+    import re
+    patterns = [
+        r'^(halo|hai|hey|hi|hello|test|tes)\b',
+        r'^(iya|ya|ok|oke|okey|okay|okelah|sip|mantap|good|nice|great|okeh)\s*$',
+        r'^(thanks?|makasih|terima kasih|trims|thx|thank you)\s*$',
+        r'^(siapa|kamu)\b.*',
+        r'^(sudah|udah|selesai|done|finish)\s*$',
+        r'^(lol|wkwk|haha|hehe|wkwkwk)\s*$',
+        r'^(coba|tanya)\s+\w+\s*$',
+        r'^(paham|ngerti|ok sip|oke sip|mantul|gas|gaskeun)\s*$',
+        r'^iya\s+betul$',
+        r'^nggak?\s*ada\s*$',
+        r'^gitu\s*$',
+    ]
+    return any(re.match(p, last) for p in patterns)
+
 def call_llm(messages):
-    global _current_model_config
-    
-    messages = _trim_messages(messages, MAX_TOKENS)
+    _summarize_context(messages)
+    messages = _trim_messages(messages, _effective_max_tokens())
     
     if not _joki_cancel.is_set():
         _joki_cancel.clear()
     _attempted_ids = set()  # track (base_url, model) tuples tried in this call
+    _attempted_keys = set()  # track (api_key, base_url, model) tried in this call (non-quota failures)
+
+    # Snapshot these at call time to avoid races if /model or mode changes mid-stream
+    _snapshot_task_mode = _current_task_mode
+    _snapshot_tools = _current_tools()
+
+    _show_thinking = not _is_small_talk(messages)
 
     for _attempt in range(20):  # safety limit
-        mc = _current_model_config
+        mc = copy.deepcopy(_current_model_config)
         identity = (mc["base_url"], mc["model"])
         _attempted_ids.add(identity)
 
         all_keys = mc.get("api_keys") or [mc.get("api_key", "")]
         needs_key = mc.get("provider") != "ollama"
-        available = [(i, k) for i, k in enumerate(all_keys) if k not in _exhausted_keys and (k or not needs_key)]
+        available = [(i, k) for i, k in enumerate(all_keys) if k not in _exhausted_keys and (k, mc["base_url"], mc["model"]) not in _attempted_keys and (k or not needs_key)]
 
         if not available:
             fallback = mc.get("fallback", "")
             if fallback and fallback in _MODELS:
                 fb_id = (_MODELS[fallback]["base_url"], _MODELS[fallback]["model"])
                 if fb_id not in _attempted_ids:
-                    _current_model_config = dict(_MODELS[fallback])
-                    _console.print(f"[yellow]⚠ Model fallback: {_current_model_config['name']} ({_current_model_config['model']})[/yellow]")
+                    _current_model_config.clear()
+                    _current_model_config.update(_MODELS[fallback])
+                    _console.print(f"[{_color_warn()}]⚠ Model fallback: {_current_model_config['name']} ({_current_model_config['model']})[/{_color_warn()}]")
                     continue
 
             # coba model lain di config.json yang belum dicoba
             found_untried = False
-            for km, vm in _MODELS.items():
+            for vm in _MODELS.values():
                 vid = (vm["base_url"], vm["model"])
                 if vid not in _attempted_ids:
-                    _current_model_config = dict(vm)
-                    _console.print(f"[yellow]⚠ Model dicoba: {vm['name']} ({vm['model']})[/yellow]")
+                    _current_model_config.clear()
+                    _current_model_config.update(vm)
+                    _console.print(f"[{_color_warn()}]⚠ Model dicoba: {vm['name']} ({vm['model']})[/{_color_warn()}]")
                     found_untried = True
                     break
             if found_untried:
@@ -72,12 +310,12 @@ def call_llm(messages):
             # semua model habis — tampilkan notifikasi
             from rich.panel import Panel
             _console.print(Panel(
-                "[bold red]SEMUA MODEL HABIS QUOTA![/bold red]\n\n"
+                f"[bold {_color_error()}]SEMUA MODEL HABIS QUOTA![/bold {_color_error()}]\n\n"
                 "Semua API key di semua model yang tersedia sudah habis quota.\n"
                 "Gunakan [bold]/reset_quota[/bold] untuk mereset status, atau\n"
                 "isi API key baru di [bold]config.json[/bold].",
-                title="😵 QUOTA HABIS",
-                border_style="red"
+                title=f"[bold {_color_error()}]😵 QUOTA HABIS[/bold {_color_error()}]",
+                border_style=_border_error()
             ))
             return {"role": "assistant", "content": "[ERROR] Semua model di config.json sudah habis quota. Gunakan /reset_quota untuk reset."}
 
@@ -87,23 +325,43 @@ def call_llm(messages):
 
             result = []
             error_data = []
-            thinking = ThinkingDisplay()
+            thinking = ThinkingDisplay(disabled=not _show_thinking)
 
-            def _do_request(key=api_key, idx=key_idx, model_cfg=mc):
+            def _do_request(key=api_key, idx=key_idx, model_cfg=mc, thinking=thinking, result=result, error_data=error_data):
                 try:
                     is_openai = model_cfg["provider"] == "openai"
                     headers = {"Content-Type": "application/json"}
                     if key:
-                        headers["Authorization"] = f"Bearer {key}"
+                        auth_header = model_cfg.get("api_key_header", "Authorization")
+                        if auth_header == "Authorization":
+                            headers["Authorization"] = f"Bearer {key}"
+                        else:
+                            headers[auth_header] = key
                     MAX_RETRIES = 3
                     RETRYABLE_ERRORS = (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError)
+
+                    def _is_retryable_exc(e):
+                        if isinstance(e, RETRYABLE_ERRORS):
+                            return True
+                        # Error server transient (500/502/503/dll) layak di-retry,
+                        # tidak seperti 4xx yang harus ditangani key/model berikutnya.
+                        if isinstance(e, httpx.HTTPStatusError):
+                            return e.response.status_code >= 500
+                        return False
+
                     for retry in range(MAX_RETRIES):
+                        if _joki_cancel.is_set():
+                            return
                         try:
                             if is_openai:
                                 url = f"{model_cfg['base_url']}/chat/completions"
                                 resp_max_tokens = model_cfg.get("max_tokens", 8192)
-                                body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "tool_choice": "auto", "max_tokens": resp_max_tokens, "stream": True}
-                                
+                                body = {"model": model_cfg["model"], "messages": messages, "tools": _snapshot_tools, "tool_choice": "auto", "max_tokens": resp_max_tokens, "stream": True}
+                                if "reasoning" in model_cfg:
+                                    body["reasoning"] = model_cfg["reasoning"]
+                                if "extra_body" in model_cfg:
+                                    body.update(model_cfg["extra_body"])
+
                                 content_parts = []
                                 tool_calls_dict = {}
                                 message_role = "assistant"
@@ -114,20 +372,23 @@ def call_llm(messages):
                                         err_data = r.read()
                                         raise httpx.HTTPStatusError(f"{err_data}", request=r.request, response=r)
                                     for line in r.iter_lines():
+                                        if _joki_cancel.is_set():
+                                            return
                                         if line.startswith("data: ") and line != "data: [DONE]":
                                             chunk = json.loads(line[6:])
-                                            if "choices" in chunk and chunk["choices"]:
+                                            if chunk.get("choices"):
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "role" in delta:
                                                     message_role = delta["role"]
-                                                if "content" in delta and delta["content"]:
+                                                reasoning_content = delta.get("reasoning_content")
+                                                if reasoning_content:
+                                                    thinking.push(reasoning_content)
+
+                                                if delta.get("content"):
                                                     content = delta["content"]
                                                     content_parts.append(content)
                                                     thinking.push(content)
-                                                elif "tool_calls" in delta and delta["tool_calls"]:
-                                                    if not content_parts:
-                                                        thinking.push("⚙️")
-                                                if "tool_calls" in delta and delta["tool_calls"]:
+                                                if delta.get("tool_calls"):
                                                     for tc in delta["tool_calls"]:
                                                         tc_idx = tc["index"]
                                                         if tc_idx not in tool_calls_dict:
@@ -185,7 +446,7 @@ def call_llm(messages):
                                         for tc2 in m2.get("tool_calls", []):
                                             try:
                                                 a2 = json.loads(tc2["function"]["arguments"]) if isinstance(tc2["function"]["arguments"], str) else tc2["function"]["arguments"]
-                                            except Exception:
+                                            except Exception:  # noqa: BLE001
                                                 a2 = {}
                                             parts.append({"functionCall": {"name": tc2["function"]["name"], "args": a2}})
                                         if parts:
@@ -198,7 +459,7 @@ def call_llm(messages):
                                         elif ct:
                                             contents.append({"role": "user", "parts": [{"text": ct}]})
                                 g_tools = []
-                                for t2 in TOOLS:
+                                for t2 in _snapshot_tools:
                                     f2 = t2.get("function", {})
                                     g_tools.append({"functionDeclarations": [{"name": f2.get("name", ""), "description": f2.get("description", ""), "parameters": f2.get("parameters", {})}]})
                                 body = {
@@ -219,9 +480,11 @@ def call_llm(messages):
                                         err_data = r.read()
                                         raise httpx.HTTPStatusError(f"{err_data}", request=r.request, response=r)
                                     for line in r.iter_lines():
+                                        if _joki_cancel.is_set():
+                                            return
                                         if line.startswith("data: ") and line != "data: [DONE]":
                                             chunk = json.loads(line[6:])
-                                            if "candidates" in chunk and chunk["candidates"]:
+                                            if chunk.get("candidates"):
                                                 cand = chunk["candidates"][0]
                                                 if "content" in cand and "parts" in cand["content"]:
                                                     for part in cand["content"]["parts"]:
@@ -239,13 +502,11 @@ def call_llm(messages):
                                                                     "arguments": json.dumps(fc.get("args", {}))
                                                                 }
                                                             }
-                                                            if not content_parts:
-                                                                thinking.push("⚙️")
                                                 if "finishReason" in cand:
                                                     fr = cand["finishReason"]
                                                     if fr == "MAX_TOKENS":
                                                         _truncated = True
-                                final_msg = {"role": message_role}
+                                final_msg: dict = {"role": message_role}
                                 if content_parts:
                                     full_content = "".join(content_parts)
                                     if _truncated:
@@ -257,9 +518,8 @@ def call_llm(messages):
                                     final_msg["tool_calls"] = [tool_calls_dict[i] for i in sorted(tool_calls_dict)]
                                 result.append(final_msg)
                             else:
-                                thinking.push("⚙️ Memproses...")
                                 url = f"{model_cfg['base_url']}/api/chat"
-                                body = {"model": model_cfg["model"], "messages": messages, "tools": TOOLS, "stream": False, "max_tokens": model_cfg.get("max_tokens", 8192)}
+                                body = {"model": model_cfg["model"], "messages": messages, "tools": _current_tools(), "stream": False, "max_tokens": model_cfg.get("max_tokens", 8192)}
                                 r = httpx.post(url, json=body, headers=headers, timeout=120, follow_redirects=True)
                                 data = r.json()
                                 if r.status_code != 200:
@@ -269,13 +529,15 @@ def call_llm(messages):
                                     raise httpx.HTTPStatusError(f"{err_info}", request=r.request, response=r)
                                 result.append(data["message"])
                             break
-                        except RETRYABLE_ERRORS as e:
+                        except Exception as _re:
+                            if not _is_retryable_exc(_re):
+                                raise
                             if retry == MAX_RETRIES - 1:
                                 raise
                             delay = (2 ** retry) + random.uniform(0, 1)
-                            _console.print(f"[yellow]Network error, retry in {delay:.1f}s...[/yellow]")
+                            _console.print(f"[{_color_warn()}]Network/server error, retry in {delay:.1f}s...[/{_color_warn()}]")
                             time.sleep(delay)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     err_resp = getattr(e, "response", None)
                     if err_resp is not None:
                         status = err_resp.status_code
@@ -293,21 +555,29 @@ def call_llm(messages):
                     else:
                         error_data.append(("err", str(e)))
 
-            req = threading.Thread(target=_do_request, daemon=True)
+            req = threading.Thread(target=_do_request, daemon=False)
             req.start()
 
-            with thinking:
-                while req.is_alive():
-                    if _joki_cancel.is_set():
-                        req.join(1)
-                        break
-                    req.join(timeout=0.02)
+            try:
+                with thinking:
+                    while req.is_alive():
+                        if _joki_cancel.is_set():
+                            req.join(timeout=2.0)
+                            break
+                        thinking.update()
+                        req.join(timeout=0.02)
+            finally:
+                if req.is_alive():
+                    req.join(timeout=2.0)
 
             if _joki_cancel.is_set():
                 return {"role": "assistant", "content": "[CANCELLED] Permintaan dibatalkan oleh pengguna."}
 
             if error_data:
-                _exhausted_keys.add(api_key)
+                if error_data[0][0] == "quota":
+                    _exhausted_keys.add(api_key)
+                else:
+                    _attempted_keys.add((api_key, mc["base_url"], mc["model"]))
                 continue
 
             return result[0]

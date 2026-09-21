@@ -1,7 +1,16 @@
-import os, json, subprocess, threading, queue, re, time, shutil
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
 from pathlib import Path
-from joki.state import _console, _LSP_LOCK, _LSP_CLIENTS
-from joki.display import _Spinner
+
+from rich.markup import escape
+
+from joki.display import _color_error, _color_ok, _color_warn, _Spinner
+from joki.state import _LSP_CLIENTS, _LSP_LOCK, _console
 
 _BUILTIN_SERVERS = {
     "javascript":  {"command": ["typescript-language-server", "--stdio"], "ext": [".js", ".jsx", ".mjs", ".cjs"]},
@@ -22,6 +31,8 @@ _BUILTIN_SERVERS = {
     "css":         {"command": ["vscode-css-language-server", "--stdio"], "ext": [".css", ".scss", ".less"]},
     "swift":       {"command": ["sourcekit-lsp"], "ext": [".swift"]},
 }
+
+_RENAME_DISABLED_LANGS = {"c_cpp", "lua", "bash", "yaml", "html", "css", "swift"}
 
 _TRIGGER_KEYWORDS = [
     "error", "bug", "fix", "perbaiki", "masalah", "gagal", "rusak",
@@ -62,38 +73,39 @@ _LANG_NAMES = {
 }
 
 
-def _try_install_lsp(lang):
+def _try_install_lsp(lang, auto=False):
     cmd_template = _INSTALL_COMMANDS.get(lang)
     if not cmd_template:
         return False
     name = _LANG_NAMES.get(lang, lang)
     if not shutil.which(cmd_template[0]):
-        _console.print(f"[yellow]Tidak bisa install LSP {name}: '{cmd_template[0]}' tidak ditemukan.[/yellow]")
+        _console.print(f"[{_color_warn()}]Tidak bisa install LSP {name}: '{cmd_template[0]}' tidak ditemukan.[/{_color_warn()}]")
         _console.print(f"  Install manual: [bold]{' '.join(cmd_template)}[/bold]")
         return False
-    _console.print(f"[yellow]LSP server untuk {name} tidak terinstall.[/yellow]")
+    _console.print(f"[{_color_warn()}]LSP server untuk {name} tidak terinstall.[/{_color_warn()}]")
     _console.print(f"  Install: [bold]{' '.join(cmd_template)}[/bold]")
-    try:
-        ans = input("  Install sekarang? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        ans = "n"
-    if ans not in ("y", "yes"):
-        _console.print(f"  [dim]Skip. Jalankan '/install-lsp {lang}' kapan saja.[/dim]")
-        return False
+    if not auto:
+        try:
+            ans = input("  Install sekarang? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans not in ("y", "yes"):
+            _console.print(f"  [dim]Skip. Jalankan '/install-lsp {lang}' kapan saja.[/dim]")
+            return False
     _console.print(f"  [dim]Menginstall {name} LSP server...[/dim]")
     try:
-        r = subprocess.run(cmd_template, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd_template, capture_output=True, text=True, timeout=120, check=False)
         if r.returncode == 0:
-            _console.print(f"  [green]Berhasil install {name} LSP server![/green]")
+            _console.print(f"  [{_color_ok()}]Berhasil install {name} LSP server![/{_color_ok()}]")
             return True
         else:
-            _console.print(f"  [red]Gagal install: {r.stderr.strip()}[/red]")
+            _console.print(f"  [{_color_error()}]Gagal install: {escape(r.stderr.strip())}[/{_color_error()}]")
             return False
     except subprocess.TimeoutExpired:
-        _console.print(f"  [red]Timeout install (120 detik)[/red]")
+        _console.print(f"  [{_color_error()}]Timeout install (120 detik)[/{_color_error()}]")
         return False
-    except Exception as e:
-        _console.print(f"  [red]Error: {e}[/red]")
+    except Exception as e:  # noqa: BLE001
+        _console.print(f"  [{_color_error()}]Error: {escape(str(e))}[/{_color_error()}]")
         return False
 
 
@@ -134,8 +146,7 @@ def _path_to_uri(path):
 
 
 def _uri_to_path(uri):
-    if uri.startswith("file://"):
-        uri = uri[7:]
+    uri = uri.removeprefix("file://")
     return uri
 
 
@@ -163,6 +174,7 @@ class LspClient:
         self.process = None
         self._reader_thread = None
         self._write_lock = threading.Lock()
+        self._data_lock = threading.Lock()  # protects _pending, _responses, _pending_diags from reader thread race
         self._req_id = 0
         self._pending = {}
         self._responses = {}
@@ -186,8 +198,8 @@ class LspClient:
             )
         except FileNotFoundError:
             return False
-        except Exception as e:
-            _console.print(f"[dim]LSP {self.lang}: Gagal spawn: {e}[/dim]")
+        except Exception as e:  # noqa: BLE001
+            _console.print(f"[dim]LSP {self.lang}: Gagal spawn: {escape(str(e))}[/dim]")
             return False
 
         self._reader_stop.clear()
@@ -230,12 +242,13 @@ class LspClient:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=3)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 self.process.kill()
             self.process = None
-        self._opened_files.clear()
-        self._pending.clear()
-        self._responses.clear()
+        with self._data_lock:
+            self._opened_files.clear()
+            self._pending.clear()
+            self._responses.clear()
 
     def open_file(self, path, content=None, force_reload=False):
         path = os.path.abspath(path)
@@ -245,7 +258,7 @@ class LspClient:
             try:
                 with open(path, "r", errors="ignore") as f:
                     content = f.read()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return False
         uri = self._opened_files.get(path) or _path_to_uri(path)
         lang_id = self.lang
@@ -263,8 +276,6 @@ class LspClient:
             lang_id = "cpp" if path.endswith((".cpp", ".hpp", ".cxx", ".hxx", ".cc")) else "c"
         elif lang_id == "bash":
             lang_id = "shellscript"
-        else:
-            lang_id = lang_id
 
         version = self._opened_files.get(path, {}).get("version", 0) + 1 if isinstance(self._opened_files.get(path), dict) else 1
         if path in self._opened_files:
@@ -295,16 +306,18 @@ class LspClient:
 
     def get_file_diagnostics(self, path):
         path = os.path.abspath(path)
-        return self._pending_diags.get(path, [])
+        with self._data_lock:
+            return list(self._pending_diags.get(path, []))
 
     def get_all_diagnostics(self):
         result = []
-        for path, diags in self._pending_diags.items():
-            for d in diags:
-                result.append((path, d))
+        with self._data_lock:
+            for path, diags in list(self._pending_diags.items()):
+                for d in diags:
+                    result.append((path, d))
         return result
 
-    def query(self, operation, file_path, symbol=None, line=None, character=None):
+    def query(self, operation, file_path, symbol=None, line=None, character=None, new_name=None):
         file_path = os.path.abspath(file_path)
         if not self.open_file(file_path, force_reload=True):
             return f"Error: Gagal membuka file {file_path}"
@@ -327,6 +340,16 @@ class LspClient:
             return self._query_document_symbol(uri)
         elif operation == "workspaceSymbol":
             return self._query_workspace_symbol(symbol or file_path)
+        elif operation == "rename":
+            if not new_name:
+                return "Error: Parameter 'newName' wajib untuk operasi rename."
+            return self._query_rename(uri, line or 0, character or 0, new_name)
+        elif operation == "codeActions":
+            if line is None or character is None:
+                return "Error: Parameter 'line' dan 'character' wajib untuk codeActions."
+            return self._query_code_actions(uri, line, character)
+        elif operation == "format":
+            return self._query_format(uri)
         else:
             return f"Error: Operasi LSP tidak dikenal: {operation}"
 
@@ -403,7 +426,6 @@ class LspClient:
             rng = r.get("start", {}) if isinstance(r, dict) else {}
             line_no = rng.get("line", 0) + 1
             children = sym.get("children", [])
-            prefix = ""
             if children:
                 for c in children:
                     cname = c.get("name", "?")
@@ -411,6 +433,108 @@ class LspClient:
                     lines.append(f"  {ckind} {cname}")
             lines.append(f"{kind_name} {name} (line {line_no})")
         return "\n".join(lines) if lines else "(tidak ada simbol)"
+
+    def _query_rename(self, uri, line, character, new_name):
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+            "newName": new_name,
+        }
+        result = self._send_request("textDocument/rename", params)
+        if not result:
+            return "(rename tidak menghasilkan perubahan)"
+        changes = result.get("changes", {})
+        if not changes:
+            return "(tidak ada perubahan — simbol mungkin tidak ditemukan)"
+        total_edits = 0
+        affected_files = []
+        for doc_uri, edits in changes.items():
+            fpath = _uri_to_path(doc_uri)
+            affected_files.append(f"{fpath} ({len(edits)} changes)")
+            total_edits += len(edits)
+            for edit in edits:
+                rng = edit.get("range", {})
+                start = rng.get("start", {})
+                new_text = edit.get("newText", "")
+                try:
+                    with open(fpath, "r") as f:
+                        content = f.read()
+                    lines = content.splitlines(True)
+                    s_line, s_char = start.get("line", 0), start.get("character", 0)
+                    end = rng.get("end", {})
+                    e_line, e_char = end.get("line", 0), end.get("character", 0)
+                    if s_line == e_line:
+                        line_text = lines[s_line]
+                        lines[s_line] = line_text[:s_char] + new_text + line_text[e_char:]
+                    else:
+                        lines[s_line] = lines[s_line][:s_char] + new_text
+                        for l in range(s_line + 1, e_line + 1):
+                            lines[l] = ""
+                    with open(fpath, "w") as f:
+                        f.writelines(lines)
+                except Exception as ex:  # noqa: BLE001
+                    return f"Error menulis perubahan ke {fpath}: {ex}"
+        summary = f"Rename selesai: {total_edits} perubahan di {len(affected_files)} file"
+        for f in affected_files:
+            summary += f"\n  \u2713 {f}"
+        return summary
+
+    def _query_code_actions(self, uri, line, character):
+        with self._data_lock:
+            diags = list(self._pending_diags.get(_uri_to_path(uri), []))
+        context = {
+            "diagnostics": diags,
+            "only": ["quickfix", "refactor", "refactor.extract", "source.organizeImports"],
+        }
+        params = {
+            "textDocument": {"uri": uri},
+            "range": {"start": {"line": line, "character": character},
+                      "end": {"line": line + 1, "character": 0}},
+            "context": context,
+        }
+        result = self._send_request("textDocument/codeAction", params)
+        if not result:
+            return "(tidak ada code action tersedia)"
+        if not isinstance(result, list):
+            result = [result]
+        lines = []
+        for i, action in enumerate(result[:20]):
+            title = action.get("title", "?")
+            kind = action.get("kind", "")
+            lines.append(f"{i+1}. [{kind}] {title}")
+        if lines:
+            lines.insert(0, f"{len(result)} code action(s) tersedia. Jalankan via executeCodeAction dengan index.")
+        return "\n".join(lines) if lines else "(tidak ada code action)"
+
+    def _query_format(self, uri):
+        result = self._send_request("textDocument/formatting", {
+            "textDocument": {"uri": uri},
+            "options": {"tabSize": 4, "insertSpaces": True},
+        })
+        if not result:
+            return "(tidak ada perubahan formatting)"
+        path = _uri_to_path(uri)
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+            lines = content.splitlines(True)
+            for edit in sorted(result, key=lambda e: (e["range"]["start"]["line"], e["range"]["start"]["character"]), reverse=True):
+                rng = edit["range"]
+                s_line, s_char = rng["start"]["line"], rng["start"]["character"]
+                e_line, e_char = rng["end"]["line"], rng["end"]["character"]
+                new_text = edit.get("newText", "")
+                if s_line == e_line:
+                    old_line = lines[s_line]
+                    lines[s_line] = old_line[:s_char] + new_text + old_line[e_char:]
+                else:
+                    lines[s_line] = lines[s_line][:s_char] + new_text
+                    for l in range(s_line + 1, e_line + 1):
+                        lines[l] = ""
+            with open(path, "w") as f:
+                f.writelines(lines)
+            return f"File diformat: {path} ({len(result)} perubahan)"
+        except Exception as ex:  # noqa: BLE001
+            return f"Error formatting: {ex}"
 
     def _query_workspace_symbol(self, query):
         result = self._send_request("workspace/symbol", {
@@ -438,7 +562,8 @@ class LspClient:
         self._req_id += 1
         req_id = self._req_id
         event = threading.Event()
-        self._pending[req_id] = event
+        with self._data_lock:
+            self._pending[req_id] = event
 
         payload = _json_rpc_encode(req_id, method, params)
         with self._write_lock:
@@ -447,8 +572,9 @@ class LspClient:
                 self.process.stdin.flush()
 
         event.wait(timeout=30)
-        self._pending.pop(req_id, None)
-        return self._responses.pop(req_id, None)
+        with self._data_lock:
+            self._pending.pop(req_id, None)
+            return self._responses.pop(req_id, None)
 
     def _send_notify(self, method, params=None):
         payload = _json_rpc_notify(method, params)
@@ -457,13 +583,15 @@ class LspClient:
                 try:
                     self.process.stdin.write(payload.encode())
                     self.process.stdin.flush()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     def _reader(self):
         while not self._reader_stop.is_set():
             try:
-                raw = self.process.stdout.read(1)
+                if not self.process or not self.process.stdout:
+                    break
+                raw = self.process.stdout.read(1)  # type: ignore[union-attr]
                 if not raw:
                     break
                 self._buf += raw
@@ -474,7 +602,9 @@ class LspClient:
                         length = int(cl_match.group(1))
                         need = length - len(rest)
                         while need > 0 and not self._reader_stop.is_set():
-                            chunk = self.process.stdout.read(need)
+                            if not self.process or not self.process.stdout:
+                                break
+                            chunk = self.process.stdout.read(need)  # type: ignore[union-attr]
                             if not chunk:
                                 break
                             rest += chunk
@@ -487,7 +617,7 @@ class LspClient:
                             self._buf = header + b"\r\n\r\n" + rest
                     else:
                         self._buf = b""
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
 
     def _handle_message(self, body):
@@ -496,18 +626,18 @@ class LspClient:
         except json.JSONDecodeError:
             return
         if "id" in msg:
-            self._responses[msg["id"]] = msg.get("result")
-            event = self._pending.get(msg.get("id"))
+            with self._data_lock:
+                self._responses[msg["id"]] = msg.get("result")
+                event = self._pending.get(msg.get("id"))
             if event:
                 event.set()
         elif msg.get("method") == "textDocument/publishDiagnostics":
             uri = msg.get("params", {}).get("uri", "")
             diags = msg.get("params", {}).get("diagnostics", [])
             path = _uri_to_path(uri)
-            self._pending_diags[path] = diags
-        elif msg.get("method") == "window/logMessage":
-            pass
-        elif "result" in msg:
+            with self._data_lock:
+                self._pending_diags[path] = diags
+        elif msg.get("method") == "window/logMessage" or "result" in msg:
             pass
 
 
@@ -531,7 +661,7 @@ def _find_symbol_in_file(file_path, symbol):
             idx = line.find(symbol)
             if idx != -1:
                 return i, idx
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return 0, 0
 
@@ -554,7 +684,7 @@ def _get_lsp_client(lang, project_dir):
         cfg = available.get(lang)
         if not cfg:
             name = _LANG_NAMES.get(lang, lang)
-            _console.print(f"[yellow]LSP {name}: server tidak tersedia.[/yellow]")
+            _console.print(f"[{_color_warn()}]LSP {name}: server tidak tersedia.[/{_color_warn()}]")
             if _try_install_lsp(lang):
                 available = _get_available_servers()
                 cfg = available.get(lang)
@@ -570,12 +700,13 @@ def _get_lsp_client(lang, project_dir):
 
 def _cleanup_lsp():
     with _LSP_LOCK:
-        for key, client in list(_LSP_CLIENTS.items()):
-            try:
-                client.stop()
-            except Exception:
-                pass
+        clients = list(_LSP_CLIENTS.items())
         _LSP_CLIENTS.clear()
+    for key, client in clients:
+        try:
+            client.stop()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 def _is_error_query(text):
@@ -603,7 +734,7 @@ def get_project_diagnostics(project_dir):
                 try:
                     if os.path.getsize(fpath) > 500_000:
                         continue
-                except Exception:
+                except Exception:  # noqa: BLE001, S112
                     continue
                 files_by_lang.setdefault(lang, []).append(fpath)
 
@@ -657,6 +788,7 @@ def handle_lsp_query(args):
     symbol = args.get("symbol", "")
     line = args.get("line")
     character = args.get("character")
+    new_name = args.get("newName", "")
 
     if not operation or not file_path:
         return "Error: 'operation' dan 'file_path' wajib diisi."
@@ -670,13 +802,16 @@ def handle_lsp_query(args):
     if not lang:
         return f"Tidak ada LSP server untuk file {file_path}"
 
+    if operation == "rename" and lang in _RENAME_DISABLED_LANGS:
+        return f"LSP rename tidak didukung untuk {_LANG_NAMES.get(lang, lang)}."
+
     project_dir = _find_project_root(file_path)
     client = _get_lsp_client(lang, project_dir)
     if not client:
         return f"LSP server untuk {lang} tidak tersedia atau gagal start."
 
     with _Spinner(f"LSP {operation}"):
-        return client.query(operation, file_path, symbol, line, character)
+        return client.query(operation, file_path, symbol, line, character, new_name)
 
 
 def _find_project_root(file_path):
@@ -701,7 +836,7 @@ def handle_install_lsp_command(args):
         for lang_name, cfg in sorted(_BUILTIN_SERVERS.items()):
             name = _LANG_NAMES.get(lang_name, lang_name)
             exts = ", ".join(cfg["ext"])
-            status = "[green]Tersedia[/green]" if lang_name in available else "[red]Tidak terinstall[/red]"
+            status = f"[{_color_ok()}]Tersedia[/{_color_ok()}]" if lang_name in available else f"[{_color_error()}]Tidak terinstall[/{_color_error()}]"
             install_cmd = " ".join(_INSTALL_COMMANDS.get(lang_name, [])) if _INSTALL_COMMANDS.get(lang_name) else "(manual)"
             _console.print(f"  {name:12} {status:20} {exts}")
             if lang_name not in available and _INSTALL_COMMANDS.get(lang_name):
@@ -715,4 +850,8 @@ def handle_install_lsp_command(args):
         else:
             _console.print(f"LSP server '{lang}' tidak dikenal.")
         return
-    _try_install_lsp(lang)
+    name = _LANG_NAMES.get(lang, lang)
+    if lang in _get_available_servers():
+        _console.print(f"[{_color_ok()}]LSP server {name} sudah terinstall.[/{_color_ok()}]")
+        return
+    _try_install_lsp(lang, auto=True)

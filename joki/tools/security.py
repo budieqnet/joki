@@ -1,14 +1,34 @@
-import subprocess
 import re
 import socket
 import ssl
+import subprocess
+
 import httpx
 from duckduckgo_search import DDGS
+
 from joki.display import _Spinner
+from joki.state import _console
+
+
+def _http_verify(args):
+    return not args.get("skip_ssl_verify", False)
+
+
+def _require_target_authorization(args, tool_name):
+    if args.get("target_authorized") is not True:
+        return (f"Error: {tool_name} butuh otorisasi target. "
+                f"Pastikan Anda memiliki izin untuk scan target ini, "
+                f"set target_authorized=true untuk melanjutkan.")
+    return None
 
 
 def handle_port_scan(args):
-    target = args["target"]
+    target = args.get("target", "")
+    if not target:
+        return "Error: Parameter 'target' wajib diisi. Contoh: port_scan(target=\"192.168.1.1\")"
+    auth_error = _require_target_authorization(args, "port_scan")
+    if auth_error:
+        return auth_error
     port_str = args.get("ports", "common")
     scan_type = args.get("scan_type", "quick")
     results = []
@@ -44,7 +64,7 @@ def handle_port_scan(args):
             if r == 0:
                 try:
                     service = socket.getservbyport(port)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     service = "unknown"
                 results.append(f"  PORT {port:>5}/tcp  OPEN  {service}")
             sock.close()
@@ -55,24 +75,31 @@ def handle_port_scan(args):
         "\n".join(results)
 
 
+def _dns_lookup(domain, rtype):
+    r = subprocess.run(
+        ["dig", "+short", domain, rtype],
+        capture_output=True, text=True, timeout=15, check=False
+    )
+    return r.stdout.strip()
+
+
 def handle_dns_enum(args):
-    domain = args["domain"]
+    domain = args.get("domain", "")
+    if not domain:
+        return "Error: Parameter 'domain' wajib diisi. Contoh: dns_enum(domain=\"example.com\")"
     action = args.get("action", "records")
     output = []
 
     if action in ("records", "all"):
         record_types = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"]
         for rtype in record_types:
-            r = subprocess.run(
-                ["dig", "+short", domain, rtype],
-                capture_output=True, text=True, timeout=15
-            )
-            if r.stdout.strip():
+            result = _dns_lookup(domain, rtype)
+            if result:
                 output.append(f"  {rtype} Records:")
-                for line in r.stdout.strip().splitlines():
+                for line in result.splitlines():
                     output.append(f"    {line}")
         if not output:
-            output.append("  (no DNS records found via dig)")
+            output.append("  (no DNS records found)")
 
     if action in ("subdomains", "all"):
         common_subdomains = [
@@ -90,14 +117,12 @@ def handle_dns_enum(args):
         for sd in common_subdomains:
             sd_target = f"{sd}.{domain}"
             try:
-                r = subprocess.run(
-                    ["dig", "+short", sd_target, "A"],
-                    capture_output=True, text=True, timeout=3
-                )
-                if r.stdout.strip():
-                    output.append(f"    {sd_target} -> {r.stdout.strip()}")
+                result = _dns_lookup(sd_target, "A")
+                if result:
+                    ip = result.splitlines()[0].strip()
+                    output.append(f"    {sd_target} -> {ip}")
                     found += 1
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         output.append(f"  Found {found} subdomains")
 
@@ -105,13 +130,19 @@ def handle_dns_enum(args):
 
 
 def handle_web_vuln_scan(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: web_vuln_scan(url=\"https://example.com\")"
+    auth_error = _require_target_authorization(args, "web_vuln_scan")
+    if auth_error:
+        return auth_error
     checks = args.get("checks", "headers,info")
+    _verify = _http_verify(args)
     output = []
 
     try:
-        r = httpx.get(url, timeout=15, follow_redirects=True, verify=False)
-    except Exception as e:
+        r = httpx.get(url, timeout=60, follow_redirects=True, verify=_verify)
+    except Exception as e:  # noqa: BLE001
         return f"[WEB_VULN] Error accessing {url}: {e}"
 
     output.append(f"  URL: {url}")
@@ -166,7 +197,7 @@ def handle_web_vuln_scan(args):
             try:
                 encoded = urllib.parse.quote(payload)
                 test_url = f"{url}?id={encoded}"
-                rr = httpx.get(test_url, timeout=10, verify=False)
+                rr = httpx.get(test_url, timeout=10, verify=_verify)
                 if rr.status_code == 200:
                     import html
                     body_lower = rr.text.lower()
@@ -190,7 +221,7 @@ def handle_web_vuln_scan(args):
                         output.append(f"    OK (payload: {desc})")
                 else:
                     output.append(f"    {rr.status_code} (payload: {desc})")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 output.append(f"    Error (payload: {desc})")
 
     if "xss" in checks or "all" in checks:
@@ -200,35 +231,77 @@ def handle_web_vuln_scan(args):
             "<img src=x onerror=alert(1)>",
             "\"><script>alert(1)</script>",
         ]
-        import urllib.parse
         import html
+        import urllib.parse
         for payload in xss_payloads:
             try:
                 encoded = urllib.parse.quote(payload)
                 test_url = f"{url}?q={encoded}"
-                rr = httpx.get(test_url, timeout=10, verify=False)
+                rr = httpx.get(test_url, timeout=10, verify=_verify)
                 if html.unescape(payload) in rr.text or payload in rr.text:
                     output.append(
-                        f"    \033[31mSUSPECT XSS\033[0m (payload reflected)")
+                        "    \033[31mSUSPECT XSS\033[0m (payload reflected)")
                 else:
                     output.append(
                         f"    No reflection (payload: {payload[:30]})")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 output.append(f"    Error (payload: {payload[:30]})")
 
     return f"[WEB_VULN] Scan result for {url}:\n" + "\n".join(output)
 
 
+def _whois_socket(domain):
+    try:
+        whois_server = "whois.iana.org"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect((whois_server, 43))
+        sock.send(f"{domain}\r\n".encode())
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+        sock.close()
+        text = response.decode(errors="replace")
+
+        # Try to find authoritative whois server
+        for line in text.splitlines():
+            if "whois" in line.lower() and "." in line and "server" in line.lower():
+                parts = line.split(":")
+                if len(parts) > 1:
+                    ref_server = parts[-1].strip()
+                    if ref_server and ref_server != whois_server:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(15)
+                        sock.connect((ref_server, 43))
+                        sock.send(f"{domain}\r\n".encode())
+                        response = b""
+                        while True:
+                            data = sock.recv(4096)
+                            if not data:
+                                break
+                            response += data
+                        sock.close()
+                        return response.decode(errors="replace")
+        return text
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def handle_whois_lookup(args):
-    target = args["target"]
+    target = args.get("target", "")
+    if not target:
+        return "Error: Parameter 'target' wajib diisi. Contoh: whois_lookup(target=\"example.com\")"
     with _Spinner(f"WHOIS lookup {target}"):
-        r = subprocess.run(
-            ["whois", target],
-            capture_output=True, text=True, timeout=30
-        )
-    output = r.stdout or r.stderr
+        try:
+            r = subprocess.run(["whois", target], capture_output=True, text=True, timeout=30, check=False)
+            output = r.stdout or r.stderr or _whois_socket(target)
+        except FileNotFoundError:
+            output = _whois_socket(target)
     if not output:
-        return f"  No WHOIS data for {target} (install whois: sudo apt install whois)"
+        return f"  No WHOIS data for {target}"
     lines = output.splitlines()
     important = []
     keywords = [
@@ -264,23 +337,30 @@ def handle_whois_lookup(args):
 
 
 def handle_ssl_check(args):
-    host = args["host"]
+    host = args.get("host", "")
+    if not host:
+        return "Error: Parameter 'host' wajib diisi. Contoh: ssl_check(host=\"example.com\")"
     port = int(args.get("port", 443))
     output = []
 
     try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+        ctx = ssl.create_default_context()  # type: ignore[attr-defined]
+        with socket.create_connection((host, port), timeout=10) as sock, ctx.wrap_socket(sock, server_hostname=host) as ssock:  # type: ignore[union-attr]
                 cert = ssock.getpeercert()
                 output.append(f"  Host: {host}:{port}")
                 output.append(f"  Protocol: {ssock.version()}")
 
                 if cert:
+                    subject_dict = {}
+                    for part in cert.get('subject', []):
+                        subject_dict.update(dict(part))
+                    issuer_dict = {}
+                    for part in cert.get('issuer', []):
+                        issuer_dict.update(dict(part))
                     output.append(
-                        f"  Subject: {dict(cert['subject'][0]).get('commonName', 'N/A')}")
+                        f"  Subject: {subject_dict.get('commonName', 'N/A')}")
                     output.append(
-                        f"  Issuer: {dict(cert['issuer'][0]).get('organizationName', 'N/A')}")
+                        f"  Issuer: {issuer_dict.get('organizationName', 'N/A')}")
                     output.append(
                         f"  Serial: {cert.get('serialNumber', 'N/A')}")
                     output.append(
@@ -289,12 +369,12 @@ def handle_ssl_check(args):
                         f"  Valid Until: {cert.get('notAfter', 'N/A')}")
 
                     import datetime
-                    not_after = cert.get('notAfter', '')
+                    not_after = str(cert.get('notAfter', ''))
                     if not_after:
                         try:
                             exp = datetime.datetime.strptime(
-                                not_after, "%b %d %H:%M:%S %Y %Z")
-                            remaining = (exp - datetime.datetime.now()).days
+                                not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
+                            remaining = (exp - datetime.datetime.now(datetime.timezone.utc)).days
                             if remaining < 0:
                                 output.append(
                                     f"  \033[31mEXPIRED ({abs(remaining)} days ago)\033[0m")
@@ -304,19 +384,19 @@ def handle_ssl_check(args):
                             else:
                                 output.append(
                                     f"  \033[32mValid: {remaining} days remaining\033[0m")
-                        except Exception:
-                            pass
+                        except Exception:  # noqa: BLE001
+                            _console.print("[dim]Warning: Gagal parsing tanggal sertifikat[/dim]")
 
                     san = cert.get('subjectAltName', [])
                     if san:
-                        domains = [v for k, v in san if k == 'DNS']
+                        domains = [str(v) for k, v in san if k == 'DNS']
                         output.append(
                             f"  SAN: {', '.join(domains[:5])}{'...' if len(domains) > 5 else ''}")
                 else:
                     output.append("  No certificate returned")
     except ssl.SSLError as e:
         output.append(f"  SSL Error: {e}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         output.append(f"  Connection Error: {e}")
 
     if not output:
@@ -325,11 +405,17 @@ def handle_ssl_check(args):
 
 
 def handle_dir_bruteforce(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: dir_bruteforce(url=\"https://example.com\")"
+    auth_error = _require_target_authorization(args, "dir_bruteforce")
+    if auth_error:
+        return auth_error
     wordlist_size = args.get("wordlist", "small")
     extensions = args.get("extensions", "")
     ext_list = [f".{e.strip()}" for e in extensions.split(",")
                 if e.strip()] if extensions else []
+    _verify = _http_verify(args)
 
     wordlists = {
         "small": ["admin", "login", "wp-admin", "backup", "config", "db", "sql",
@@ -378,36 +464,39 @@ def handle_dir_bruteforce(args):
         for path in paths:
             test_url = f"{url}/{path}"
             try:
-                rr = httpx.get(test_url, timeout=5, verify=False)
+                rr = httpx.get(test_url, timeout=5, verify=_verify)
                 if rr.status_code in (
                         200, 201, 204, 301, 302, 307, 308, 401, 403):
                     size = len(rr.content)
                     found.append(
                         f"  {rr.status_code:>3}  {size:>8}b  {test_url}")
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                _console.print(f"[dim]Warning: Gagal mengakses {test_url}[/dim]")
 
             if ext_list:
                 for ext in ext_list:
                     test_url_ext = f"{url}/{path}{ext}"
                     try:
-                        rr = httpx.get(test_url_ext, timeout=5, verify=False)
+                        rr = httpx.get(test_url_ext, timeout=5, verify=_verify)
                         if rr.status_code in (
                                 200, 201, 204, 301, 302, 307, 308, 401, 403):
                             size = len(rr.content)
                             found.append(
                                 f"  {rr.status_code:>3}  {size:>8}b  {test_url_ext}")
-                    except Exception:
-                        pass
+                    except Exception:  # noqa: BLE001
+                        _console.print(f"[dim]Warning: Gagal mengakses {test_url_ext}[/dim]")
 
-    if not found:
-        return f"[DIRBRUTE] No paths found on {url} ({len(paths)} tested)"
+        if not found:
+            return f"[DIRBRUTE] No paths found on {url} ({len(paths)} tested)"
     return f"[DIRBRUTE] Found {len(found)} paths on {url}:\n" + \
         "\n".join(found)
 
 
 def handle_cve_search(args):
-    query = args["query"]
+    query = args.get("query", "")
+    if not query:
+        return "Error: Parameter 'query' wajib diisi. Contoh: cve_search(query=\"apache 2.4.49\")"
+    _verify = _http_verify(args)
     with _Spinner(f"Searching CVEs for {query}"):
         try:
             search_url = f"https://cve.circl.lu/api/search/{query.replace(' ', '/')}"
@@ -415,12 +504,12 @@ def handle_cve_search(args):
                 search_url,
                 timeout=20,
                 follow_redirects=True,
-                verify=False)
+                verify=_verify)
             if r.status_code == 200:
                 data = r.json()
             else:
                 data = None
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = None
 
     output = []
@@ -437,7 +526,7 @@ def handle_cve_search(args):
         if not output:
             output.append(f"  No CVEs found for '{query}'")
     else:
-        output.append(f"  CIRCL API unavailable, searching via web...")
+        output.append("  CIRCL API unavailable, searching via web...")
         try:
             results = DDGS().text(f"CVE {query}", max_results=5)
             if results:
@@ -448,27 +537,31 @@ def handle_cve_search(args):
                     output.append("")
             else:
                 output.append(f"  No results found for '{query}'")
-        except Exception:
+        except Exception:  # noqa: BLE001
             output.append(f"  Error searching for '{query}'")
 
     return f"[CVE] Results for '{query}':\n" + "\n".join(output)
 
 
 def handle_tech_detect(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: tech_detect(url=\"https://example.com\")"
     deep = args.get("deep", "simple")
+    timeout = args.get("timeout", 60)
+    _verify = _http_verify(args)
     output = []
     tech = {}
 
     try:
         r = httpx.get(
             url,
-            timeout=15,
+            timeout=timeout,
             follow_redirects=True,
-            verify=False,
+            verify=_verify,
             headers={
                 "User-Agent": "Mozilla/5.0"})
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"[TECH] Error accessing {url}: {e}"
 
     output.append(f"  URL: {url}")
@@ -491,7 +584,7 @@ def handle_tech_detect(args):
 
     output.append("\n  [Cookies]")
     for cookie in r.cookies:
-        name = cookie.name
+        name = getattr(cookie, "name", str(cookie))
         output.append(f"    {name}")
 
     if deep == "deep":
@@ -531,7 +624,7 @@ def handle_tech_detect(args):
             "New Relic": ["newrelic", "nr-"],
         }
 
-        output.append(f"\n  [Detected Technologies]")
+        output.append("\n  [Detected Technologies]")
         for name, sigs in sorted(detectors.items()):
             for sig in sigs:
                 if sig in html or sig in r.text.lower():
@@ -541,9 +634,9 @@ def handle_tech_detect(args):
             for name in sorted(tech, key=lambda k: -tech[k]):
                 output.append(f"    {name}")
         else:
-            output.append(f"    (no specific tech detected)")
+            output.append("    (no specific tech detected)")
 
-        output.append(f"\n  [HTML Analysis]")
+        output.append("\n  [HTML Analysis]")
         title_match = re.search(
             r'<title[^>]*>(.*?)</title>',
             r.text,
@@ -573,19 +666,22 @@ def handle_tech_detect(args):
 
 
 def handle_api_discover(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: api_discover(url=\"https://example.com\")"
     depth = int(args.get("depth", 2))
+    _verify = _http_verify(args)
     output = []
 
     try:
         r = httpx.get(
             url,
-            timeout=15,
+            timeout=60,
             follow_redirects=True,
-            verify=False,
+            verify=_verify,
             headers={
                 "User-Agent": "Mozilla/5.0"})
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"[API] Error accessing {url}: {e}"
 
     text = r.text
@@ -593,7 +689,7 @@ def handle_api_discover(args):
 
     output.append(f"  Target: {url}")
 
-    output.append(f"\n  [Form Actions]")
+    output.append("\n  [Form Actions]")
     form_actions = re.findall(
         r'<form[^>]+action=["\']([^"\']+)["\']',
         text,
@@ -602,9 +698,9 @@ def handle_api_discover(args):
         apis.add(fa)
         output.append(f"    {fa}")
     if not form_actions:
-        output.append(f"    (no forms found)")
+        output.append("    (no forms found)")
 
-    output.append(f"\n  [Inline API Calls]")
+    output.append("\n  [Inline API Calls]")
     fetch_patterns = [
         r'fetch\(["\']([^"\']+)["\']',
         r'axios\.\w+\(["\']([^"\']+)["\']',
@@ -619,7 +715,7 @@ def handle_api_discover(args):
             output.append(f"    {m.group(1)[:100]}")
 
     if depth >= 2:
-        output.append(f"\n  [Script File URLs]")
+        output.append("\n  [Script File URLs]")
         js_srcs = re.findall(
             r'<script[^>]+src=["\']([^"\']+)["\']',
             text,
@@ -629,7 +725,7 @@ def handle_api_discover(args):
                 url.rstrip("/") + "/" + js_src.lstrip("/"))
             try:
                 rr = httpx.get(
-                    js_url, timeout=10, verify=False, headers={
+                    js_url, timeout=10, verify=_verify, headers={
                         "User-Agent": "Mozilla/5.0"})
                 if rr.status_code == 200:
                     inner_patterns = [
@@ -643,18 +739,18 @@ def handle_api_discover(args):
                     for ipat in inner_patterns:
                         for m in re.finditer(ipat, rr.text, re.IGNORECASE):
                             apis.add(m.group(1))
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                _console.print(f"[dim]Warning: Gagal fetch JS: {js_url}[/dim]")
 
         if apis:
-            output.append(f"\n  [Unique API Paths Found]")
+            output.append("\n  [Unique API Paths Found]")
             for api in sorted(apis)[:40]:
                 output.append(f"    {api}")
         else:
-            output.append(f"\n  [Unique API Paths Found]")
-            output.append(f"    (none found)")
+            output.append("\n  [Unique API Paths Found]")
+            output.append("    (none found)")
 
-        output.append(f"\n  [API Patterns]")
+        output.append("\n  [API Patterns]")
         api_patterns_found = set()
         for api in apis:
             parts = api.rstrip("/").split("/")
@@ -674,29 +770,32 @@ def handle_api_discover(args):
             for p in sorted(api_patterns_found)[:15]:
                 output.append(f"    /{p.lstrip('/')}")
         else:
-            output.append(f"    (no specific API pattern)")
+            output.append("    (no specific API pattern)")
 
     return f"[API] API Discovery for {url}:\n" + "\n".join(output)
 
 
 def handle_source_map_check(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: source_map_check(url=\"https://example.com\")"
+    _verify = _http_verify(args)
     output = []
 
     try:
         r = httpx.get(
             url,
-            timeout=15,
+            timeout=60,
             follow_redirects=True,
-            verify=False,
+            verify=_verify,
             headers={
                 "User-Agent": "Mozilla/5.0"})
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"[SOURCEMAP] Error accessing {url}: {e}"
 
     output.append(f"  Target: {url}")
 
-    output.append(f"\n  [Source Map Discovery]")
+    output.append("\n  [Source Map Discovery]")
     js_srcs = re.findall(
         r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']',
         r.text,
@@ -713,11 +812,11 @@ def handle_source_map_check(args):
         alt_map = re.sub(r'\.js$', '.map', js_url)
         for mu in [map_url, alt_map]:
             try:
-                mr = httpx.head(mu, timeout=5, verify=False)
+                mr = httpx.head(mu, timeout=5, verify=_verify)
                 if mr.status_code in (200, 204):
                     found_maps.append(mu)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                _console.print(f"[dim]Warning: Gagal cek source map: {mu}[/dim]")
 
     comment_maps = re.findall(r'//#\s*sourceMappingURL=(.+\.map)', r.text)
     if comment_maps:
@@ -727,17 +826,17 @@ def handle_source_map_check(args):
             found_maps.append(cm)
 
     if found_maps:
-        output.append(f"  \033[31mEXPOSED SOURCE MAPS DETECTED!\033[0m")
+        output.append("  \033[31mEXPOSED SOURCE MAPS DETECTED!\033[0m")
         for fm in sorted(set(found_maps)):
             output.append(f"    {fm}")
     else:
-        output.append(f"  No source maps found (good)")
+        output.append("  No source maps found (good)")
 
     if found_maps:
-        output.append(f"\n  [Content from First Source Map]")
+        output.append("\n  [Content from First Source Map]")
         try:
-            sm_url = list(set(found_maps))[0]
-            sm_r = httpx.get(sm_url, timeout=10, verify=False)
+            sm_url = next(iter(set(found_maps)))
+            sm_r = httpx.get(sm_url, timeout=10, verify=_verify)
             if sm_r.status_code == 200:
                 sm_data = sm_r.json()
                 sources = sm_data.get("sources", [])
@@ -750,25 +849,28 @@ def handle_source_map_check(args):
                     output.append(f"    Identifiers ({len(names)}):")
                     for n in names[:20]:
                         output.append(f"      {n}")
-        except Exception:
-            output.append(f"    (could not parse source map)")
+        except Exception:  # noqa: BLE001
+            output.append("    (could not parse source map)")
 
     return f"[SOURCEMAP] Source Map Check for {url}:\n" + "\n".join(output)
 
 
 def handle_form_analyze(args):
-    url = args["url"].rstrip("/")
+    url = args.get("url", "").rstrip("/")
+    if not url:
+        return "Error: Parameter 'url' wajib diisi. Contoh: form_analyze(url=\"https://example.com/login\")"
+    _verify = _http_verify(args)
     output = []
 
     try:
         r = httpx.get(
             url,
-            timeout=15,
+            timeout=60,
             follow_redirects=True,
-            verify=False,
+            verify=_verify,
             headers={
                 "User-Agent": "Mozilla/5.0"})
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"[FORM] Error accessing {url}: {e}"
 
     output.append(f"  Target: {url}")
@@ -780,7 +882,7 @@ def handle_form_analyze(args):
         re.IGNORECASE | re.DOTALL)
 
     if not forms:
-        output.append(f"\n  No forms found")
+        output.append("\n  No forms found")
         return f"[FORM] Form Analysis for {url}:\n" + "\n".join(output)
 
     output.append(f"\n  Forms found: {len(forms)}")
@@ -808,7 +910,7 @@ def handle_form_analyze(args):
         if enctype:
             output.append(f"    Enctype: {enctype.group(1)}")
 
-        output.append(f"\n    [Fields]")
+        output.append("\n    [Fields]")
         inputs = re.findall(r'(<input[^>]*>)', form_body, re.IGNORECASE)
         selects = re.findall(
             r'(<select[^>]*>.*?</select>)',
@@ -826,7 +928,6 @@ def handle_form_analyze(args):
                 r'name=["\']([^"\']*)["\']', inp, re.IGNORECASE)
             inp_val = re.search(
                 r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
-            inp_id = re.search(r'id=["\']([^"\']*)["\']', inp, re.IGNORECASE)
             inp_auto = re.search(
                 r'autocomplete=["\']([^"\']*)["\']',
                 inp,
@@ -864,7 +965,7 @@ def handle_form_analyze(args):
             form_html,
             re.IGNORECASE)
         if csrf_inputs:
-            output.append(f"    \033[32m[CSRF Protection Detected]\033[0m")
+            output.append("    \033[32m[CSRF Protection Detected]\033[0m")
             for c in csrf_inputs:
                 output.append(f"      CSRF field: {c}")
 
