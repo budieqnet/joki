@@ -153,7 +153,7 @@ def reload_skills():
     """Paksa baca ulang semua file skill + state (untuk /skills reload)."""
     _SKILL_CACHE["key"] = None
     _SKILL_CACHE["skills"] = []
-    _DISABLED["names"] = set()
+    _DISABLED["names"] = None
 
 
 def is_skill_active(sk):
